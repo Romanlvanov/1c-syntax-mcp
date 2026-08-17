@@ -1,1 +1,6 @@
-mcp>=1.0.0
+# mcp 2.0.0 (2026-07-28) removed the low-level Server decorator API
+# (@app.list_tools()/@app.call_tool()) that server.py uses — see docs/IMPROVEMENT_PLAN.md.
+mcp>=1.10,<2
+lxml>=5.0
+rapidfuzz>=3.14
+snowballstemmer>=3.1

@@ -12,6 +12,8 @@ ENV/
 
 # Generated files
 syntax_tree.json
+syntax_index.sqlite
+index/
 extracted_syntax/
 *.hbk
 
