@@ -1,95 +1,30 @@
 #!/usr/bin/env python3
-"""MCP сервер для проверки синтаксиса 1С."""
+"""MCP сервер для проверки синтаксиса 1С.
 
-import argparse
+Поддерживает два транспорта: stdio (локальный запуск, см. README) и streamable
+HTTP (контейнер, веб-панель — docs/IMPROVEMENT_PLAN.md, Docker-раздел). Состояние
+собранных индексов и версия по умолчанию инкапсулированы в index_manager.IndexRegistry
+вместо модульных глобалов — это позволяет безопасно обслуживать HTTP-запросы,
+панель и фоновую сборку индекса из одного процесса одновременно."""
+
 import asyncio
-import hashlib
 import sys
-from pathlib import Path
-from typing import Optional
 
+import anyio
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from platforms import find_all_platforms, find_newest_with_help, find_platform
-from syntax_db import SyntaxDB, build_index, diff_versions
+import platforms as platforms_mod
+from config import load_settings
+from index_manager import IndexRegistry
+from syntax_db import diff_versions as syntax_diff_versions
 from validate import check_call
 
 app = Server("1c-syntax-mcp")
 
-INDEX_DIR = Path(__file__).parent / "index"
-_syntax_dbs: dict = {}  # версия -> SyntaxDB, ленивая загрузка при первом обращении
-_default_version: Optional[str] = None
-
-
-def _db_path_for(version: str) -> Path:
-    return INDEX_DIR / version / "syntax_index.sqlite"
-
-
-def _hbk_sha256(path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def ensure_index(version: str, force: bool = False) -> bool:
-    """Гарантирует наличие актуального индекса для указанной версии платформы.
-
-    Union-индекс по нескольким версиям (docs/IMPROVEMENT_PLAN.md §5.2) в этой
-    реализации не строится — каждая версия хранится отдельным файлом
-    index/<версия>/syntax_index.sqlite; это проще и уже покрывает все критерии
-    Этапа 3 (сборка по ≥2 версиям, diff, `since`). Экономия union (~66 МБ вместо
-    ~966 МБ на 15 версий) становится значимой только если реально держать все
-    версии одновременно собранными — не типичный сценарий использования.
-    """
-    platform = find_platform(version)
-    if platform is None or not platform.has_help:
-        print(f"Версия {version} не установлена или не имеет справки (shcntx_ru.hbk)", file=sys.stderr)
-        return _db_path_for(version).exists()
-
-    db_path = _db_path_for(version)
-    hbk_path = platform.hbk_paths["shcntx_ru"]
-
-    if not force and db_path.exists():
-        try:
-            probe = SyntaxDB(db_path)
-            row = probe.conn.execute("SELECT hbk_sha256 FROM schema_meta LIMIT 1").fetchone()
-            probe.close()
-            if row and row[0] == _hbk_sha256(hbk_path):
-                return True
-        except Exception:
-            pass  # индекс повреждён или собран старой схемой -- пересоберём
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Сборка индекса {version} из {hbk_path}...", file=sys.stderr, flush=True)
-    count = build_index(
-        hbk_path, db_path,
-        platform_version=version, hbk_sha256=_hbk_sha256(hbk_path),
-        shquery_hbk_path=platform.hbk_paths.get("shquery_ru"),
-        shlang_hbk_path=platform.hbk_paths.get("shlang_ru"),
-    )
-    print(f"Индекс {version} собран: {count} элементов -> {db_path}", file=sys.stderr, flush=True)
-    return True
-
-
-def get_db(version: Optional[str] = None) -> Optional[SyntaxDB]:
-    """SyntaxDB для версии (по умолчанию — новейшая с уже собранным индексом).
-
-    Индекс для НЕзапрошенной по умолчанию версии не строится неявно здесь —
-    сборка остаётся отдельным явным шагом (`--build-index --platform=...`),
-    а не побочным эффектом вызова инструмента."""
-    version = version or _default_version
-    if version is None:
-        return None
-    if version not in _syntax_dbs:
-        db_path = _db_path_for(version)
-        if not db_path.exists():
-            return None
-        _syntax_dbs[version] = SyntaxDB(db_path)
-    return _syntax_dbs[version]
+_registry: IndexRegistry = None  # инициализируется в run_stdio()/webapp.run_http()
+_db_limiter: anyio.CapacityLimiter = None  # ограничивает число потоков, обслуживающих БД
 
 
 def _fmt_params(params):
@@ -232,34 +167,53 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Обработка вызовов инструментов."""
+def _no_index_message(requested):
+    """Единый текст для обоих транспортов: локальный CLI-путь работает всегда,
+    Docker-путь актуален только в контейнере, но упомянуть его безвредно и там,
+    и там — лишняя строка не мешает локальному пользователю."""
+    lines = (
+        [f"Индекс для версии {requested!r} не собран."] if requested
+        else ["Индекс не собран, версия платформы не определена."]
+    )
+    lines.append(
+        "Локально: python server.py --build-index" + (f" --platform={requested}" if requested else "")
+    )
+    lines.append(
+        "В Docker: откройте веб-панель сервера (корневой путь /) и загрузите shcntx_ru.hbk, "
+        "либо смонтируйте каталог установки 1С в контейнер."
+    )
+    return "\n".join(lines)
+
+
+def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
+    """Синхронная реализация — вызывается из потока (см. call_tool ниже), чтобы
+    долгие операции (полный обход записей в diff_versions, построение fuzzy-индекса
+    при первом запросе) не блокировали event loop при HTTP-транспорте, где тот же
+    loop параллельно обслуживает веб-панель и загрузку .hbk. При stdio отдельный
+    поток не обязателен (один клиент, вызовы и так последовательны), но одна
+    реализация для обоих транспортов проще и безопаснее двух."""
+    registry = _registry
+
     if name == "list_versions":
         lines = ["Установленные версии платформы 1С:\n"]
-        for platform in find_all_platforms():
-            db_path = _db_path_for(platform.version)
-            if not platform.has_help:
+        for row in registry.list_state():
+            if not row["has_help"] and not row["indexed"]:
                 status = "нет справки (тонкий клиент)"
-            elif db_path.exists():
-                try:
-                    probe = SyntaxDB(db_path)
-                    count = probe.conn.execute("SELECT count(*) FROM entry").fetchone()[0]
-                    built_at = probe.conn.execute("SELECT built_at FROM schema_meta LIMIT 1").fetchone()[0]
-                    probe.close()
-                    status = f"проиндексировано, {count} элементов, собран {built_at}"
-                except Exception:
-                    status = "индекс повреждён или устарел — требуется пересборка"
+            elif row["indexed"] is True:
+                status = f"проиндексировано, {row['entry_count']} элементов, собран {row['built_at']}"
+            elif row["indexed"] == "error":
+                status = "индекс повреждён или собран другой схемой — требуется пересборка"
             else:
                 status = "справка есть, индекс не собран"
-            default_mark = " [по умолчанию]" if platform.version == _default_version else ""
-            lines.append(f"  · {platform.version}{default_mark} — {status}")
+            source_mark = " (загружено)" if row["source"] == "upload" else ""
+            default_mark = " [по умолчанию]" if row["is_default"] else ""
+            lines.append(f"  · {row['version']}{default_mark}{source_mark} — {status}")
         return [TextContent(type="text", text="\n".join(lines))]
 
     if name == "diff_versions":
         from_version = arguments.get("from_version", "")
         to_version = arguments.get("to_version", "")
-        db_a, db_b = _db_path_for(from_version), _db_path_for(to_version)
+        db_a, db_b = registry.db_path_for(from_version), registry.db_path_for(to_version)
         missing = [v for v, p in ((from_version, db_a), (to_version, db_b)) if not p.exists()]
         if missing:
             return [TextContent(
@@ -267,7 +221,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 text=f"Индекс не собран для версий: {', '.join(missing)}. "
                 f"Соберите: python server.py --build-index --platform=<версия>",
             )]
-        d = diff_versions(db_a, db_b)
+        d = syntax_diff_versions(db_a, db_b)
         lines = [
             f"Diff {from_version} -> {to_version}",
             f"Всего элементов: {d['total_a']} -> {d['total_b']}",
@@ -279,14 +233,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             lines.append("")
         return [TextContent(type="text", text="\n".join(lines))]
 
-    syntax_db = get_db(arguments.get("platform"))
+    syntax_db = registry.get_db(arguments.get("platform"))
     if syntax_db is None:
-        requested = arguments.get("platform") or _default_version
-        return [TextContent(
-            type="text",
-            text=f"Индекс для версии {requested!r} не собран. "
-            f"Соберите: python server.py --build-index" + (f" --platform={requested}" if requested else ""),
-        )]
+        requested = arguments.get("platform") or registry.get_default_version()
+        return [TextContent(type="text", text=_no_index_message(requested))]
 
     if name == "search_syntax":
         query = arguments.get("query", "")
@@ -361,53 +311,104 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text=f"Неизвестный инструмент: {name}")]
 
 
-async def main():
-    """Запуск MCP сервера."""
-    global _default_version
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    """Обработка вызовов инструментов — в потоке из общего пула (см. _call_tool_sync)."""
+    return await anyio.to_thread.run_sync(_call_tool_sync, name, arguments, limiter=_db_limiter)
 
-    platform = find_newest_with_help()
-    if platform is None:
-        print("Не найдена установленная версия 1С со справкой (shcntx_ru.hbk)", file=sys.stderr)
-        return
-    _default_version = platform.version
 
-    if not ensure_index(_default_version):
-        print(f"Ошибка: индекс для {_default_version} не собран", file=sys.stderr)
-        return
+def _configure_platforms(settings):
+    platforms_mod.configure(extra_paths=settings.platform_paths, upload_dir=settings.upload_dir)
 
-    db = get_db(_default_version)
-    count = db.conn.execute("SELECT count(*) FROM entry").fetchone()[0]
-    print(f"Индекс {_default_version} загружен: {count} элементов", file=sys.stderr, flush=True)
+
+def _ensure_default_built(registry, settings, transport_label):
+    """Гарантирует индекс для версии по умолчанию, если авто-сборка включена;
+    иначе только сообщает о недостающем индексе. Возвращает выбранную версию
+    (может быть None, если платформ не найдено и готового индекса тоже нет —
+    сервер в HTTP-режиме всё равно поднимается, старое поведение stdio-режима
+    (print+return при отсутствии платформы) здесь недопустимо: панель для
+    загрузки .hbk нужна именно в этом случае)."""
+    version = registry.resolve_default(forced_version=settings.default_version)
+    if version is None:
+        print("Установленных версий 1С со справкой не найдено, готового индекса тоже нет. "
+              "Соберите индекс явно или, в Docker, загрузите shcntx_ru.hbk через веб-панель.",
+              file=sys.stderr, flush=True)
+        return None
+
+    if not registry.has_built_index(version):
+        if settings.auto_build:
+            try:
+                registry.build_version(version)
+            except Exception as e:
+                print(f"Не удалось собрать индекс {version}: {e}", file=sys.stderr, flush=True)
+                return version
+        else:
+            print(f"Индекс для {version} не собран, автосборка выключена ({transport_label}).",
+                  file=sys.stderr, flush=True)
+            return version
+
+    if registry.has_built_index(version):
+        db = registry.get_db(version)
+        count = db.conn.execute("SELECT count(*) FROM entry").fetchone()[0]
+        print(f"Индекс {version} загружен: {count} элементов", file=sys.stderr, flush=True)
+    return version
+
+
+async def run_stdio(settings):
+    global _registry, _db_limiter
+    _configure_platforms(settings)
+    _registry = IndexRegistry(settings.index_dir, auto_build=settings.auto_build)
+    _db_limiter = anyio.CapacityLimiter(settings.db_threads)
+
+    _ensure_default_built(_registry, settings, "stdio")
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
-def _cli_build_index():
-    parser = argparse.ArgumentParser(description="Сборка индекса синтаксиса 1С")
-    parser.add_argument("--build-index", action="store_true", required=True)
-    parser.add_argument("--platform", help="Собрать индекс только для этой версии")
-    parser.add_argument("--all", action="store_true", help="Собрать индекс для всех версий со справкой")
-    parser.add_argument("--force", action="store_true", help="Пересобрать, даже если индекс актуален")
-    args = parser.parse_args()
+def _cli_build_index(settings, args):
+    """Отдельная явная команда сборки индекса — не побочный эффект запуска сервера."""
+    _configure_platforms(settings)
+    registry = IndexRegistry(settings.index_dir, auto_build=False)
 
     if args.all:
-        versions = [p.version for p in find_all_platforms() if p.has_help]
+        versions = [p.version for p in platforms_mod.find_all_platforms() if p.has_help]
     elif args.platform:
         versions = [args.platform]
     else:
-        newest = find_newest_with_help()
+        newest = platforms_mod.find_newest_with_help()
         if newest is None:
             print("Не найдена установленная версия 1С со справкой", file=sys.stderr)
-            return
+            return 1
         versions = [newest.version]
 
+    exit_code = 0
     for version in versions:
-        ensure_index(version, force=args.force)
+        try:
+            result = registry.build_version(version, force=args.force)
+            if result["rebuilt"]:
+                print(f"Индекс {version} собран: {result['count']} элементов -> {result['path']}",
+                      file=sys.stderr, flush=True)
+            else:
+                print(f"Индекс {version} актуален, пересборка не требуется", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"Ошибка сборки индекса {version}: {e}", file=sys.stderr, flush=True)
+            exit_code = 1
+    return exit_code
+
+
+def main():
+    settings, args = load_settings()
+
+    if args.build_index:
+        sys.exit(_cli_build_index(settings, args) or 0)
+
+    if settings.transport == "http":
+        from webapp import run_http  # ленивый импорт: HTTP-стек не нужен для stdio/CLI
+        run_http(settings)
+    else:
+        asyncio.run(run_stdio(settings))
 
 
 if __name__ == "__main__":
-    if "--build-index" in sys.argv:
-        _cli_build_index()
-    else:
-        asyncio.run(main())
+    main()

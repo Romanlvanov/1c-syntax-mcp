@@ -13,9 +13,14 @@ ENV/
 # Generated files
 syntax_tree.json
 syntax_index.sqlite
+*.fingerprint.json
 index/
+uploads/
 extracted_syntax/
 *.hbk
+
+# Docker (docker-compose.override.yml.example -- шаблон, коммитится)
+docker-compose.override.yml
 
 # IDE
 .vscode/

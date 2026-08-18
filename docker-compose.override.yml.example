@@ -1,0 +1,24 @@
+# Сценарий А (README.md): 1С уже установлена на этой машине -- смонтируйте
+# каталог установки, и версии обнаружатся автоматически, без загрузки .hbk
+# через панель.
+#
+# Скопируйте этот файл в docker-compose.override.yml (уже в .gitignore) и
+# поправьте путь под свою установку:
+#
+#   copy docker-compose.override.yml.example docker-compose.override.yml   (Windows)
+#   cp docker-compose.override.yml.example docker-compose.override.yml     (Linux/Mac)
+#
+# Если файла docker-compose.override.yml нет -- ничего страшного: сервер всё
+# равно поднимется (сценарий Б), просто без автообнаружения установленных
+# версий -- нужно будет загрузить shcntx_ru.hbk через веб-панель.
+
+services:
+  syntax-mcp:
+    volumes:
+      # Раскладка <версия>/bin/<файл>.hbk одинакова на Windows и Linux --
+      # platforms.py находит версии без единой правки кода. Путь с пробелом --
+      # обязательно в кавычках, слэши прямые (даже на Windows).
+      - "C:/Program Files/1cv8:/opt/1cv8/x86_64:ro"
+      # Другие типичные места установки (раскомментируйте нужные):
+      # - "C:/Program Files (x86)/1cv8:/opt/1cv8/x86_64:ro"
+      # - "/opt/1cv8/x86_64:/opt/1cv8/x86_64:ro"          # Linux-хост

@@ -1,0 +1,62 @@
+services:
+  syntax-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: 1c-syntax-mcp:local
+    container_name: 1c-syntax-mcp
+    init: true                     # корректная обработка SIGTERM на PID 1
+    restart: unless-stopped
+    stop_grace_period: 30s         # дать SQLite/сборке индекса завершиться штатно
+
+    ports:
+      # ТОЛЬКО loopback: панель и MCP работают без встроенной аутентификации
+      # (см. SYNTAX_MCP_PANEL_TOKEN ниже). Docker при публикации порта правит
+      # NAT напрямую и проходит мимо правил Windows Firewall -- эта форма
+      # записи (с 127.0.0.1:) единственный надёжный контроль.
+      - "127.0.0.1:${HOST_PORT:-8765}:8765"
+
+    environment:
+      SYNTAX_MCP_AUTO_BUILD: "${SYNTAX_MCP_AUTO_BUILD:-1}"
+      SYNTAX_MCP_DEFAULT_VERSION: "${SYNTAX_MCP_DEFAULT_VERSION:-}"
+      SYNTAX_MCP_MAX_UPLOAD_MB: "${SYNTAX_MCP_MAX_UPLOAD_MB:-64}"
+      SYNTAX_MCP_PANEL_TOKEN: "${SYNTAX_MCP_PANEL_TOKEN:-}"
+      SYNTAX_MCP_ALLOWED_HOSTS: "${SYNTAX_MCP_ALLOWED_HOSTS:-}"
+      SYNTAX_MCP_ALLOWED_ORIGINS: "${SYNTAX_MCP_ALLOWED_ORIGINS:-}"
+
+    volumes:
+      # Производные данные (индексы SQLite, 52-60 МБ на версию) и исходные
+      # данные (загруженные через панель .hbk) -- РАЗНЫЕ тома: индекс можно
+      # сбросить и пересобрать за ~10 секунд, .hbk без источника установки
+      # 1С может быть невосстановим.
+      - syntaxmcp-index:/data/index
+      - syntaxmcp-hbk:/data/hbk
+      # Установка 1С с хоста монтируется отдельно -- см.
+      # docker-compose.override.yml.example (там же -- почему не в этом файле)
+
+    mem_limit: 1024m
+    memswap_limit: 1024m           # своп не должен маскировать OOM во время сборки
+    pids_limit: 256
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/api/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s            # автосборка индекса на старте не должна флапать healthcheck
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  syntaxmcp-index:
+  syntaxmcp-hbk:

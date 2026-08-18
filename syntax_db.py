@@ -24,10 +24,13 @@ COLLATE NOCASE` даёт false. Поэтому сравнение имён ид�
 
 import datetime
 import json
+import logging
 import os
 import re
 import sqlite3
-from pathlib import PurePosixPath
+import threading
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote
 
 from rapidfuzz import fuzz, process
 
@@ -39,6 +42,8 @@ from normalization import is_latin_only, norm, qwerty_to_jcuken, skeleton
 from segmentation import index_tokens
 
 SCHEMA_VERSION = 4
+
+_logger = logging.getLogger(__name__)
 
 _CATEGORY_DIRS = {"methods": "method", "properties": "property", "ctors": "ctor", "events": "event"}
 _CATALOG_RUBRIC_RE = re.compile(r"^catalog\d+$")
@@ -338,14 +343,25 @@ def _iter_bsl_syntax_entries(zf):
 
 
 def build_index(hbk_path, db_path, platform_version=None, hbk_sha256=None,
-                shquery_hbk_path=None, shlang_hbk_path=None):
+                shquery_hbk_path=None, shlang_hbk_path=None, progress=None):
     """Строит SQLite-индекс из shcntx_ru.hbk, опционально дополняя языком запросов
     (shquery_ru.hbk, language='sdbl') и синтаксисом встроенного языка (shlang_ru.hbk,
-    kind='bsl_syntax'). Отдельный шаг, не побочный эффект запуска."""
+    kind='bsl_syntax'). Отдельный шаг, не побочный эффект запуска.
+
+    Все входные .hbk открываются ДО удаления существующего db_path: битый или
+    обрезанный файл (например, недогруженный через веб-панель) падает
+    HbkFormatError раньше, чем что-либо на диске тронуто — рабочий индекс не
+    уничтожается неудачной попыткой пересборки.
+
+    progress(phase, done, total), если передан, вызывается периодически во время
+    обхода основного архива — используется веб-панелью для индикатора прогресса."""
+    zf = open_hbk(hbk_path)
+    shquery_zf = open_hbk(shquery_hbk_path) if shquery_hbk_path is not None else None
+    shlang_zf = open_hbk(shlang_hbk_path) if shlang_hbk_path is not None else None
+
     if os.path.exists(db_path):
         os.remove(db_path)
 
-    zf = open_hbk(hbk_path)
     db = sqlite3.connect(db_path)
     db.executescript(_DDL)
 
@@ -358,20 +374,31 @@ def build_index(hbk_path, db_path, platform_version=None, hbk_sha256=None,
         ":params_json,:return_type,:description,:availability,:since,:name_tokens,:descr_stem)"
     )
     count = 0
+    total_main = len(zf.namelist())
+    if progress is not None:
+        progress("entries", 0, total_main)
     for entry in _iter_entries(zf):
         db.execute(insert_entry, entry)
         count += 1
+        if progress is not None and count % 2000 == 0:
+            progress("entries", count, total_main)
 
-    if shquery_hbk_path is not None:
-        for entry in _iter_sdbl_entries(open_hbk(shquery_hbk_path)):
+    if shquery_zf is not None:
+        if progress is not None:
+            progress("sdbl", 0, 0)
+        for entry in _iter_sdbl_entries(shquery_zf):
             db.execute(insert_entry, entry)
             count += 1
 
-    if shlang_hbk_path is not None:
-        for entry in _iter_bsl_syntax_entries(open_hbk(shlang_hbk_path)):
+    if shlang_zf is not None:
+        if progress is not None:
+            progress("bsl_syntax", 0, 0)
+        for entry in _iter_bsl_syntax_entries(shlang_zf):
             db.execute(insert_entry, entry)
             count += 1
 
+    if progress is not None:
+        progress("fts", count, count)
     db.commit()
 
     db.execute(
@@ -423,16 +450,44 @@ def diff_versions(db_path_a, db_path_b):
     }
 
 
+def _ro_uri(path) -> str:
+    """URI для sqlite3.connect(..., uri=True) в режиме query-only ('mode=ro').
+
+    Формат по документации SQLite (https://sqlite.org/uri.html): три слэша после
+    'file:', путь в POSIX-нотации, ':' и '/' не percent-encode'ятся. Работает
+    единообразно для Windows ('C:/Users/...' -> 'file:///C:/Users/...') и Linux
+    ('/opt/...' -> 'file:///opt/...' после снятия ведущего слэша перед склейкой)."""
+    posix = Path(path).resolve().as_posix().lstrip("/")
+    return "file:///" + quote(posix, safe="/:") + "?mode=ro"
+
+
 class SyntaxDB:
-    """Читающий доступ к собранному индексу. Один экземпляр на процесс сервера."""
+    """Читающий доступ к собранному индексу. Один экземпляр на процесс сервера,
+    но соединение — отдельное на КАЖДЫЙ поток (threading.local), открытое в
+    режиме 'mode=ro'.
+
+    При stdio-транспорте это было не нужно: обработчики инструментов синхронны,
+    и один event loop сериализовал обращения к единственному соединению сам.
+    При HTTP тот же loop параллельно обслуживает панель, загрузку .hbk и фоновую
+    сборку индекса — общее read/write-соединение с check_same_thread=False стало
+    бы источником гонок и потенциальной порчи файла, который параллельно
+    заменяет сборщик (см. build_version в index_manager.py: атомарная замена
+    через os.replace поверх временного файла). mode=ro дополнительно гарантирует,
+    что читатель никогда не создаст журнал (-journal) рядом с файлом индекса."""
 
     def __init__(self, db_path):
-        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self.db_path = str(db_path)
+        self._local = threading.local()
+        self._connections = []
+        self._connections_lock = threading.Lock()
+        self._fuzzy_lock = threading.Lock()
+        self._alias_lock = threading.Lock()
+
         version = self.conn.execute(
             "SELECT index_schema_version FROM schema_meta LIMIT 1"
         ).fetchone()
         if version is None or version[0] != SCHEMA_VERSION:
+            self.close()
             raise RuntimeError(
                 f"Индекс собран другой версией схемы ({version}); ожидается {SCHEMA_VERSION}. "
                 "Пересоберите индекс: python server.py --build-index"
@@ -441,8 +496,31 @@ class SyntaxDB:
         self._fuzzy_name_to_ids = None
         self._alias_phrases = None
 
+    def _connect(self):
+        conn = sqlite3.connect(_ro_uri(self.db_path), uri=True)
+        conn.row_factory = sqlite3.Row
+        with self._connections_lock:
+            self._connections.append(conn)
+        return conn
+
+    @property
+    def conn(self):
+        """Соединение текущего потока; создаётся лениво при первом обращении."""
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = self._connect()
+            self._local.conn = c
+        return c
+
     def close(self):
-        self.conn.close()
+        with self._connections_lock:
+            conns, self._connections = self._connections, []
+        for c in conns:
+            try:
+                c.close()
+            except sqlite3.Error:
+                pass
+        self._local = threading.local()
 
     def _row_to_dict(self, row):
         d = dict(row)
@@ -516,21 +594,30 @@ class SyntaxDB:
         sql += " LIMIT 1000"  # достаточно с запасом; корпус для одного префикса мал (измерено: <600)
         try:
             rows = [dict(r) for r in self.conn.execute(sql, params)]
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
+            _logger.warning("suggest_completions: запрос к FTS5 не выполнен (%s) — проверьте, "
+                             "что sqlite3 в этом окружении собран с FTS5", e)
             return []
         rows.sort(key=lambda r: (_KIND_PRIORITY.get(r["kind"], 9), len(r["name_ru"]), r["name_ru"]))
         return rows[:limit]
 
     def _ensure_fuzzy_index(self):
+        """Lock, а не только ленивая проверка: без него параллельные HTTP-запросы
+        могли бы одновременно построить несколько временных списков по ~50 тыс.
+        имён каждый. Двойная проверка -- чтобы не держать лок на каждый вызов
+        после первой (успешной) сборки."""
         if self._fuzzy_names is not None:
             return
-        name_to_ids = {}
-        for row in self.conn.execute("SELECT entry_id, name_ru_norm, name_en_norm FROM entry"):
-            for n in (row["name_ru_norm"], row["name_en_norm"]):
-                if n and len(n) >= _FUZZY_MIN_NAME_LEN:
-                    name_to_ids.setdefault(n, []).append(row["entry_id"])
-        self._fuzzy_name_to_ids = name_to_ids
-        self._fuzzy_names = list(name_to_ids.keys())
+        with self._fuzzy_lock:
+            if self._fuzzy_names is not None:
+                return
+            name_to_ids = {}
+            for row in self.conn.execute("SELECT entry_id, name_ru_norm, name_en_norm FROM entry"):
+                for n in (row["name_ru_norm"], row["name_en_norm"]):
+                    if n and len(n) >= _FUZZY_MIN_NAME_LEN:
+                        name_to_ids.setdefault(n, []).append(row["entry_id"])
+            self._fuzzy_name_to_ids = name_to_ids
+            self._fuzzy_names = list(name_to_ids.keys())
 
     def search(self, query, limit=10, kind=None, owner=None, language=None):
         """Строгие уровни (docs/IMPROVEMENT_PLAN.md §5.7): точное имя/fqn -> алиасы ->
@@ -575,10 +662,12 @@ class SyntaxDB:
         # фразы ("содержит значение"), а не одно слово, и токенизация их бы разбила.
         if len(results) < limit:
             if self._alias_phrases is None:
-                self._alias_phrases = [
-                    (r["phrase"], r["target_name"])
-                    for r in self.conn.execute("SELECT phrase, target_name FROM alias")
-                ]
+                with self._alias_lock:
+                    if self._alias_phrases is None:
+                        self._alias_phrases = [
+                            (r["phrase"], r["target_name"])
+                            for r in self.conn.execute("SELECT phrase, target_name FROM alias")
+                        ]
             alias_targets = [target for phrase, target in self._alias_phrases if phrase in query_norm]
             for target in alias_targets:
                 for row in self.conn.execute(
@@ -671,7 +760,8 @@ class SyntaxDB:
                         add(row, "bm25")
                         if len(results) >= limit:
                             break
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as e:
+                    _logger.warning("search: запрос к FTS5 (bm25-уровень) не выполнен (%s) — "
+                                     "проверьте, что sqlite3 в этом окружении собран с FTS5", e)
 
         return results[:limit]

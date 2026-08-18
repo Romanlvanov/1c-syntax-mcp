@@ -56,7 +56,7 @@ from _server_loader import find_syntax_index_db  # noqa: E402
 from golden_set import GOLDEN_SET, evaluate  # noqa: E402
 
 BASELINE_RECALL_AT_5 = 37 / 42  # держим точной дробью, не округлением (плавающая точка)
-BASELINE_MRR = 0.785
+BASELINE_MRR = 0.7845521541950113  # точное измеренное значение; 0.785 в логах -- округление :.3f для печати
 
 
 class SearchQualityTest(unittest.TestCase):
