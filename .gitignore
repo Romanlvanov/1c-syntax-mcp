@@ -19,8 +19,9 @@ uploads/
 extracted_syntax/
 *.hbk
 
-# Docker (docker-compose.override.yml.example -- шаблон, коммитится)
+# Docker (шаблоны *.example коммитятся, сами файлы -- нет)
 docker-compose.override.yml
+.env
 
 # IDE
 .vscode/

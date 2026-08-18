@@ -59,8 +59,11 @@ class Settings:
         return self.max_upload_mb * 1024 * 1024
 
 
-def load_settings(argv=None) -> Settings:
-    """CLI-флаги переопределяют переменные окружения, которые переопределяют дефолты."""
+def load_settings(argv=None) -> tuple:
+    """Возвращает (Settings, argparse.Namespace). CLI-флаги переопределяют
+    переменные окружения, которые переопределяют дефолты. Namespace возвращается
+    отдельно от Settings, т.к. несёт CLI-only поля сборки индекса
+    (build_index, platform, all, force), не относящиеся к рантайм-настройкам."""
     env_defaults = Settings(
         transport=os.environ.get("SYNTAX_MCP_TRANSPORT", "stdio"),
         host=os.environ.get("SYNTAX_MCP_HOST", "127.0.0.1"),
